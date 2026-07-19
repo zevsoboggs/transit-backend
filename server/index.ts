@@ -39,6 +39,9 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("[server] fatal:", e);
+  const err = e as { message?: string; code?: string };
+  console.error(
+    `[server] fatal: ${err.code ? `[${err.code}] ` : ""}${err.message ?? e}`,
+  );
   process.exit(1);
 });

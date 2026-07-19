@@ -1,20 +1,45 @@
 import pg from "pg";
 import bcrypt from "bcryptjs";
 
+// SSL: many hosted setups require TLS. Enable with PGSSL=1 / DATABASE_SSL=true.
+const wantSsl =
+  /^(1|true|require|yes)$/i.test(process.env.PGSSL || process.env.DATABASE_SSL || "") ||
+  /sslmode=require/i.test(process.env.DATABASE_URL || "");
+const ssl = wantSsl ? { rejectUnauthorized: false } : false;
+
+// Accept either a single DATABASE_URL or discrete PG* variables.
+const poolConfig: pg.PoolConfig = process.env.DATABASE_URL
+  ? { connectionString: process.env.DATABASE_URL, ssl }
+  : {
+      host: process.env.PGHOST || "51.68.225.233",
+      port: Number(process.env.PGPORT || 5432),
+      database: process.env.PGDATABASE || "ttransit",
+      user: process.env.PGUSER || "admin",
+      password: process.env.PGPASSWORD || "",
+      ssl,
+    };
+
 const pool = new pg.Pool({
-  host: process.env.PGHOST || "51.68.225.233",
-  port: Number(process.env.PGPORT || 5432),
-  database: process.env.PGDATABASE || "ttransit",
-  user: process.env.PGUSER || "admin",
-  password: process.env.PGPASSWORD || "",
-  ssl: false,
+  ...poolConfig,
   max: 10,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000,
   // The remote server drops idle sockets; recycle ours before it kills them
   // and keep the TCP connection alive.
   idleTimeoutMillis: 30000,
   keepAlive: true,
 });
+
+function dbTarget(): string {
+  if (process.env.DATABASE_URL) {
+    try {
+      const u = new URL(process.env.DATABASE_URL);
+      return `${u.hostname}:${u.port || 5432}/${u.pathname.slice(1)} (DATABASE_URL)`;
+    } catch {
+      return "DATABASE_URL";
+    }
+  }
+  return `${poolConfig.host}:${poolConfig.port}/${poolConfig.database} ssl=${!!ssl}`;
+}
 
 // A dropped idle connection emits 'error' on the pool. Without this handler
 // Node would treat it as unhandled and crash the whole process. pg already
@@ -102,7 +127,35 @@ CREATE INDEX IF NOT EXISTS idx_ledger_wallet_id ON ledger (wallet_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_type      ON ledger (type);
 `;
 
+async function connectWithRetry(attempts = 5): Promise<void> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const client = await pool.connect();
+      await client.query("SELECT 1");
+      client.release();
+      console.log(`[db] connected to ${dbTarget()}`);
+      return;
+    } catch (e) {
+      const err = e as { message?: string; code?: string };
+      console.error(
+        `[db] connect attempt ${i}/${attempts} failed for ${dbTarget()} — ` +
+          `${err.code ? `[${err.code}] ` : ""}${err.message ?? e}`,
+      );
+      if (i === attempts) {
+        console.error(
+          "[db] cannot reach PostgreSQL. Check that (1) PG* / DATABASE_URL vars are set " +
+            "correctly in Railway, (2) the DB server firewall allows Railway's outbound IP, " +
+            "and (3) set PGSSL=1 if the server requires TLS.",
+        );
+        throw e;
+      }
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+}
+
 export async function migrate() {
+  await connectWithRetry();
   await pool.query(SCHEMA);
   console.log("[db] schema ready");
 }
