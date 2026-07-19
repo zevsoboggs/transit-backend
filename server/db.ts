@@ -125,6 +125,24 @@ CREATE TABLE IF NOT EXISTS ledger (
 CREATE INDEX IF NOT EXISTS idx_ledger_ts        ON ledger (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_wallet_id ON ledger (wallet_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_type      ON ledger (type);
+
+-- TRON energy delegation orders placed via netts.io.
+CREATE TABLE IF NOT EXISTS energy_orders (
+  id              BIGSERIAL PRIMARY KEY,
+  ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  duration        TEXT NOT NULL,            -- 1h | 5m
+  amount          BIGINT NOT NULL,          -- energy units
+  receive_address TEXT NOT NULL,
+  provider_order_id TEXT,                   -- id returned by netts
+  status          TEXT NOT NULL DEFAULT 'pending',
+  est_cost_trx    NUMERIC,
+  response        JSONB,
+  detail          TEXT,
+  user_id         INTEGER,
+  user_email      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_energy_orders_ts ON energy_orders (ts DESC);
 `;
 
 async function connectWithRetry(attempts = 5): Promise<void> {

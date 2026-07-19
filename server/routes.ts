@@ -7,6 +7,15 @@ import {
   type UpstreamWallet,
 } from "./transit.js";
 import { login, requireAuth, type AuthedRequest } from "./auth.js";
+import {
+  DEPOSIT_ADDRESS,
+  ENERGY_MAX,
+  ENERGY_MIN,
+  extractOrderId,
+  extractStatus,
+  nettsApi,
+  NettsError,
+} from "./netts.js";
 
 const DAILY_LIMIT = Number(process.env.DAILY_WALLET_LIMIT || 3000);
 const PANEL_PROJECT = process.env.PANEL_PROJECT || "tranzor";
@@ -58,7 +67,7 @@ async function findOwned(id: string): Promise<WalletRow | null> {
 }
 
 interface LedgerEntry {
-  type: "issue" | "topup" | "transfer" | "rename";
+  type: "issue" | "topup" | "transfer" | "rename" | "energy";
   status: "success" | "error";
   walletId?: string | null;
   address?: string | null;
@@ -101,7 +110,7 @@ async function logLedger(e: LedgerEntry) {
 }
 
 function handleError(res: import("express").Response, e: unknown) {
-  if (e instanceof UpstreamError) {
+  if (e instanceof UpstreamError || e instanceof NettsError) {
     return res.status(e.status >= 400 && e.status < 600 ? e.status : 502).json({ error: e.message });
   }
   const msg = e instanceof Error ? e.message : "Внутренняя ошибка";
@@ -203,6 +212,144 @@ router.get("/ledger", async (req, res) => {
       params,
     );
     res.json({ entries: rows, count: total });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+// ---- energy delegation (netts.io) ------------------------------------------
+
+router.get("/energy/config", async (_req, res) => {
+  try {
+    let pricing = null;
+    try {
+      pricing = await nettsApi.priceSummary();
+    } catch {
+      /* pricing is optional; never block the form on it */
+    }
+    // Deliberately NO account balance is exposed here.
+    res.json({
+      depositAddress: DEPOSIT_ADDRESS,
+      min: ENERGY_MIN,
+      max: ENERGY_MAX,
+      durations: ["1h", "5m"],
+      pricing,
+    });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.get("/energy/orders", async (_req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress",
+              provider_order_id AS "providerOrderId", status, est_cost_trx::float8 AS "estCostTrx",
+              detail, user_email AS "userEmail"
+         FROM energy_orders
+         ORDER BY ts DESC
+         LIMIT 500`,
+    );
+    res.json({ orders: rows, count: rows.length });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/energy/order", async (req: AuthedRequest, res) => {
+  const duration = String((req.body || {}).duration || "1h") as "1h" | "5m";
+  const amount = Math.trunc(Number((req.body || {}).amount));
+  const receiveAddress = String((req.body || {}).receiveAddress || "").trim();
+
+  if (duration !== "1h" && duration !== "5m") {
+    return res.status(400).json({ error: "duration должен быть '1h' или '5m'" });
+  }
+  if (!Number.isFinite(amount) || amount < ENERGY_MIN || amount > ENERGY_MAX) {
+    return res
+      .status(400)
+      .json({ error: `Объём энергии должен быть от ${ENERGY_MIN} до ${ENERGY_MAX}` });
+  }
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(receiveAddress)) {
+    return res.status(400).json({ error: "Некорректный TRON-адрес получателя" });
+  }
+
+  // Best-effort estimated cost (sun/energy → TRX), never blocks the order.
+  let estCostTrx: number | null = null;
+  try {
+    const s = await nettsApi.priceSummary();
+    const priceSun = duration === "1h" ? s.priceSun1h : s.priceSun5m;
+    if (priceSun) estCostTrx = (amount * priceSun) / 1_000_000;
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    const resp = await nettsApi.order(duration, amount, receiveAddress);
+    const providerOrderId = extractOrderId(resp);
+    const status = extractStatus(resp) || "submitted";
+
+    const ins = await query<{ id: string }>(
+      `INSERT INTO energy_orders
+        (duration, amount, receive_address, provider_order_id, status, est_cost_trx, response, user_id, user_email)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [
+        duration,
+        amount,
+        receiveAddress,
+        providerOrderId,
+        status,
+        estCostTrx,
+        JSON.stringify(resp ?? null),
+        req.user?.id ?? null,
+        req.user?.email ?? null,
+      ],
+    );
+
+    await logLedger({
+      type: "energy",
+      status: "success",
+      address: receiveAddress,
+      network: "tron",
+      amount,
+      coinSymbol: "ENERGY",
+      detail: `${duration} · ${estCostTrx ? `≈${estCostTrx.toFixed(2)} TRX` : ""}`.trim(),
+      user: req.user ? { id: req.user.id, email: req.user.email } : null,
+    });
+
+    res.status(201).json({ id: ins.rows[0]?.id, providerOrderId, status, estCostTrx, response: resp });
+  } catch (e) {
+    await logLedger({
+      type: "energy",
+      status: "error",
+      address: receiveAddress,
+      network: "tron",
+      amount,
+      coinSymbol: "ENERGY",
+      detail: `${duration}: ${e instanceof Error ? e.message : "order failed"}`,
+      user: req.user ? { id: req.user.id, email: req.user.email } : null,
+    });
+    handleError(res, e);
+  }
+});
+
+router.post("/energy/orders/:id/check", async (req, res) => {
+  try {
+    const { rows } = await query<{ provider_order_id: string | null }>(
+      "SELECT provider_order_id FROM energy_orders WHERE id=$1",
+      [Number(req.params.id)],
+    );
+    const pid = rows[0]?.provider_order_id;
+    if (!pid) return res.status(404).json({ error: "Заказ не найден или без provider id" });
+    const resp = await nettsApi.orderCheck(pid);
+    const status = extractStatus(resp);
+    if (status) {
+      await query("UPDATE energy_orders SET status=$1, response=$2 WHERE id=$3", [
+        status,
+        JSON.stringify(resp ?? null),
+        Number(req.params.id),
+      ]);
+    }
+    res.json({ status, response: resp });
   } catch (e) {
     handleError(res, e);
   }
