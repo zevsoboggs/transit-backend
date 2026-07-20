@@ -305,6 +305,18 @@ router.get("/energy/quote", async (req, res) => {
   }
 });
 
+// Report the backend's outbound IP — this is the IP to whitelist at the
+// energy provider (they check the real source IP, not the X-Real-IP header).
+router.get("/energy/egress-ip", async (_req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    const j = (await r.json()) as { ip?: string };
+    res.json({ egressIp: j.ip ?? null, hint: "Добавьте этот IP в whitelist сервиса энергии" });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
 // ---- clients (billing, admin only) -----------------------------------------
 
 router.get("/clients", async (_req, res) => {
