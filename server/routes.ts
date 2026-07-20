@@ -11,11 +11,27 @@ import {
   DEPOSIT_ADDRESS,
   ENERGY_MAX,
   ENERGY_MIN,
-  extractOrderId,
   extractStatus,
   nettsApi,
   NettsError,
 } from "./netts.js";
+import { logLedger } from "./ledger.js";
+import {
+  placeEnergyOrder,
+  validateOrderInput,
+  OrderError,
+} from "./energyService.js";
+import {
+  clientAdmin,
+  createClient,
+  getClientById,
+  newApiKey,
+  syncDeposit,
+  creditClient,
+  computeCharge,
+  MARKUP_PERCENT,
+  type ClientRow,
+} from "./billing.js";
 
 const DAILY_LIMIT = Number(process.env.DAILY_WALLET_LIMIT || 3000);
 const PANEL_PROJECT = process.env.PANEL_PROJECT || "tranzor";
@@ -66,52 +82,13 @@ async function findOwned(id: string): Promise<WalletRow | null> {
   return rows[0] || null;
 }
 
-interface LedgerEntry {
-  type: "issue" | "topup" | "transfer" | "rename" | "energy";
-  status: "success" | "error";
-  walletId?: string | null;
-  address?: string | null;
-  network?: string | null;
-  direction?: "in" | "out" | null;
-  coin?: number | null;
-  coinSymbol?: string | null;
-  amount?: number | null;
-  toAddress?: string | null;
-  detail?: string | null;
-  user?: { id: number; email: string } | null;
-}
-
-// Never let a ledger write break the actual operation.
-async function logLedger(e: LedgerEntry) {
-  try {
-    await query(
-      `INSERT INTO ledger
-        (type, status, wallet_id, address, network, direction, coin, coin_symbol, amount, to_address, detail, user_id, user_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [
-        e.type,
-        e.status,
-        e.walletId ?? null,
-        e.address ?? null,
-        e.network ?? null,
-        e.direction ?? null,
-        e.coin ?? null,
-        e.coinSymbol ?? null,
-        e.amount ?? null,
-        e.toAddress ?? null,
-        e.detail ?? null,
-        e.user?.id ?? null,
-        e.user?.email ?? null,
-      ],
-    );
-  } catch (err) {
-    console.warn("[ledger] write failed:", err instanceof Error ? err.message : err);
-  }
-}
-
 function handleError(res: import("express").Response, e: unknown) {
-  if (e instanceof UpstreamError || e instanceof NettsError) {
+  if (e instanceof UpstreamError || e instanceof NettsError || e instanceof OrderError) {
     return res.status(e.status >= 400 && e.status < 600 ? e.status : 502).json({ error: e.message });
+  }
+  const withStatus = e as { status?: number; message?: string };
+  if (typeof withStatus?.status === "number" && withStatus.status >= 400 && withStatus.status < 600) {
+    return res.status(withStatus.status).json({ error: withStatus.message || "Ошибка" });
   }
   const msg = e instanceof Error ? e.message : "Внутренняя ошибка";
   console.error("[api]", msg);
@@ -243,11 +220,14 @@ router.get("/energy/config", async (_req, res) => {
 router.get("/energy/orders", async (_req, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress",
-              provider_order_id AS "providerOrderId", status, est_cost_trx::float8 AS "estCostTrx",
-              detail, user_email AS "userEmail"
-         FROM energy_orders
-         ORDER BY ts DESC
+      `SELECT eo.id, eo.ts, eo.duration, eo.amount::float8 AS amount,
+              eo.receive_address AS "receiveAddress", eo.provider_order_id AS "providerOrderId",
+              eo.status, eo.est_cost_trx::float8 AS "estCostTrx", eo.charge_usdt::float8 AS "chargeUsdt",
+              eo.source, eo.client_id AS "clientId", c.name AS "clientName",
+              eo.detail, eo.user_email AS "userEmail"
+         FROM energy_orders eo
+         LEFT JOIN clients c ON c.id = eo.client_id
+         ORDER BY eo.ts DESC
          LIMIT 500`,
     );
     res.json({ orders: rows, count: rows.length });
@@ -257,77 +237,32 @@ router.get("/energy/orders", async (_req, res) => {
 });
 
 router.post("/energy/order", async (req: AuthedRequest, res) => {
-  const duration = String((req.body || {}).duration || "1h") as "1h" | "5m";
-  const amount = Math.trunc(Number((req.body || {}).amount));
-  const receiveAddress = String((req.body || {}).receiveAddress || "").trim();
-
-  if (duration !== "1h" && duration !== "5m") {
-    return res.status(400).json({ error: "duration должен быть '1h' или '5m'" });
-  }
-  if (!Number.isFinite(amount) || amount < ENERGY_MIN || amount > ENERGY_MAX) {
-    return res
-      .status(400)
-      .json({ error: `Объём энергии должен быть от ${ENERGY_MIN} до ${ENERGY_MAX}` });
-  }
-  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(receiveAddress)) {
-    return res.status(400).json({ error: "Некорректный TRON-адрес получателя" });
-  }
-
-  // Best-effort estimated cost (sun/energy → TRX), never blocks the order.
-  let estCostTrx: number | null = null;
   try {
-    const s = await nettsApi.priceSummary();
-    const priceSun = duration === "1h" ? s.priceSun1h : s.priceSun5m;
-    if (priceSun) estCostTrx = (amount * priceSun) / 1_000_000;
-  } catch {
-    /* ignore */
-  }
-
-  try {
-    const resp = await nettsApi.order(duration, amount, receiveAddress);
-    const providerOrderId = extractOrderId(resp);
-    const status = extractStatus(resp) || "submitted";
-
-    const ins = await query<{ id: string }>(
-      `INSERT INTO energy_orders
-        (duration, amount, receive_address, provider_order_id, status, est_cost_trx, response, user_id, user_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [
-        duration,
-        amount,
-        receiveAddress,
-        providerOrderId,
-        status,
-        estCostTrx,
-        JSON.stringify(resp ?? null),
-        req.user?.id ?? null,
-        req.user?.email ?? null,
-      ],
+    const { duration, amount, receiveAddress } = validateOrderInput(
+      (req.body || {}).duration,
+      (req.body || {}).amount,
+      (req.body || {}).receiveAddress,
     );
 
-    await logLedger({
-      type: "energy",
-      status: "success",
-      address: receiveAddress,
-      network: "tron",
-      amount,
-      coinSymbol: "ENERGY",
-      detail: `${duration} · ${estCostTrx ? `≈${estCostTrx.toFixed(2)} TRX` : ""}`.trim(),
-      user: req.user ? { id: req.user.id, email: req.user.email } : null,
-    });
+    let client: ClientRow | null = null;
+    const clientId = (req.body || {}).clientId ? Number((req.body || {}).clientId) : null;
+    if (clientId) {
+      client = await getClientById(clientId);
+      if (!client) return res.status(404).json({ error: "Клиент не найден" });
+      if (client.status !== "active") return res.status(400).json({ error: "Клиент заблокирован" });
+    }
 
-    res.status(201).json({ id: ins.rows[0]?.id, providerOrderId, status, estCostTrx, response: resp });
-  } catch (e) {
-    await logLedger({
-      type: "energy",
-      status: "error",
-      address: receiveAddress,
-      network: "tron",
+    const admin = req.user ? { id: req.user.id, email: req.user.email } : null;
+    const result = await placeEnergyOrder({
+      duration,
       amount,
-      coinSymbol: "ENERGY",
-      detail: `${duration}: ${e instanceof Error ? e.message : "order failed"}`,
-      user: req.user ? { id: req.user.id, email: req.user.email } : null,
+      receiveAddress,
+      client,
+      admin,
+      source: "admin",
     });
+    res.status(201).json(result);
+  } catch (e) {
     handleError(res, e);
   }
 });
@@ -350,6 +285,120 @@ router.post("/energy/orders/:id/check", async (req, res) => {
       ]);
     }
     res.json({ status, response: resp });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+// ---- energy quote (admin: cost + client price) -----------------------------
+
+router.get("/energy/quote", async (req, res) => {
+  try {
+    const duration = String(req.query.duration || "1h") as "1h" | "5m";
+    const amount = Math.trunc(Number(req.query.amount));
+    if ((duration !== "1h" && duration !== "5m") || !Number.isFinite(amount)) {
+      return res.status(400).json({ error: "duration и amount обязательны" });
+    }
+    res.json(await computeCharge(duration, amount));
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+// ---- clients (billing, admin only) -----------------------------------------
+
+router.get("/clients", async (_req, res) => {
+  try {
+    const { rows } = await query<ClientRow>("SELECT * FROM clients ORDER BY created_at DESC");
+    res.json({ clients: rows.map(clientAdmin), count: rows.length, markupPercent: MARKUP_PERCENT });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/clients", async (req: AuthedRequest, res) => {
+  try {
+    const name = String((req.body || {}).name || "").trim();
+    const note = (req.body || {}).note ? String((req.body || {}).note) : undefined;
+    if (!name) return res.status(400).json({ error: "Укажите имя клиента" });
+    const client = await createClient({ name, note, adminId: req.user?.id ?? null });
+    res.status(201).json({ client: clientAdmin(client) });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.get("/clients/:id", async (req, res) => {
+  try {
+    const client = await getClientById(Number(req.params.id));
+    if (!client) return res.status(404).json({ error: "Клиент не найден" });
+    const tx = await query(
+      `SELECT id, ts, type, amount_usdt::float8 AS "amountUsdt", balance_after::float8 AS "balanceAfter",
+              ref, detail, admin_email AS "adminEmail"
+         FROM client_transactions WHERE client_id=$1 ORDER BY ts DESC LIMIT 200`,
+      [client.id],
+    );
+    res.json({ client: clientAdmin(client), transactions: tx.rows });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/clients/:id/sync", async (req: AuthedRequest, res) => {
+  try {
+    const client = await getClientById(Number(req.params.id));
+    if (!client) return res.status(404).json({ error: "Клиент не найден" });
+    const admin = req.user ? { id: req.user.id, email: req.user.email } : null;
+    const result = await syncDeposit(client, admin);
+    res.json(result);
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/clients/:id/adjust", async (req: AuthedRequest, res) => {
+  try {
+    const client = await getClientById(Number(req.params.id));
+    if (!client) return res.status(404).json({ error: "Клиент не найден" });
+    const amount = Number((req.body || {}).amount);
+    const detail = (req.body || {}).detail ? String((req.body || {}).detail) : "Ручная корректировка";
+    if (!Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ error: "Укажите ненулевую сумму (может быть отрицательной)" });
+    }
+    const admin = req.user ? { id: req.user.id, email: req.user.email } : null;
+    const balanceUsdt = await creditClient(client.id, amount, { type: "adjust", detail, admin });
+    res.json({ balanceUsdt });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/clients/:id/status", async (req, res) => {
+  try {
+    const status = String((req.body || {}).status || "");
+    if (status !== "active" && status !== "blocked") {
+      return res.status(400).json({ error: "status: active | blocked" });
+    }
+    const upd = await query("UPDATE clients SET status=$1 WHERE id=$2 RETURNING id", [
+      status,
+      Number(req.params.id),
+    ]);
+    if (!upd.rowCount) return res.status(404).json({ error: "Клиент не найден" });
+    res.json({ status });
+  } catch (e) {
+    handleError(res, e);
+  }
+});
+
+router.post("/clients/:id/rotate-key", async (req, res) => {
+  try {
+    const key = newApiKey();
+    const upd = await query("UPDATE clients SET api_key=$1 WHERE id=$2 RETURNING id", [
+      key,
+      Number(req.params.id),
+    ]);
+    if (!upd.rowCount) return res.status(404).json({ error: "Клиент не найден" });
+    res.json({ apiKey: key });
   } catch (e) {
     handleError(res, e);
   }

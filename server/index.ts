@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { initDb } from "./db.js";
 import { router } from "./routes.js";
+import { apiV1 } from "./apiV1.js";
+import { openapiSpec, swaggerHtml } from "./openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3001);
@@ -24,6 +26,13 @@ async function main() {
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  // Public client API + its documentation.
+  app.get("/api/openapi.json", (_req, res) => res.json(openapiSpec));
+  app.get("/docs", (_req, res) => res.type("html").send(swaggerHtml));
+  app.use("/api/v1", apiV1);
+
+  // Admin panel API (JWT).
   app.use("/api", router);
 
   // Serve the built frontend in production.

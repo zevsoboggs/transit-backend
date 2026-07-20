@@ -62,6 +62,26 @@ function isRetryable(e: unknown): boolean {
   return !!err?.code && RETRYABLE.has(err.code);
 }
 
+// Run a function inside a BEGIN/COMMIT transaction (rolls back on throw).
+export async function withTx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* ignore rollback error */
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   text: string,
   params?: unknown[],
@@ -126,23 +146,66 @@ CREATE INDEX IF NOT EXISTS idx_ledger_ts        ON ledger (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_wallet_id ON ledger (wallet_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_type      ON ledger (type);
 
--- TRON energy delegation orders placed via netts.io.
+-- TRON energy delegation orders (fulfilled via the upstream energy provider).
 CREATE TABLE IF NOT EXISTS energy_orders (
   id              BIGSERIAL PRIMARY KEY,
   ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
   duration        TEXT NOT NULL,            -- 1h | 5m
   amount          BIGINT NOT NULL,          -- energy units
   receive_address TEXT NOT NULL,
-  provider_order_id TEXT,                   -- id returned by netts
+  provider_order_id TEXT,                   -- id returned by the provider
   status          TEXT NOT NULL DEFAULT 'pending',
   est_cost_trx    NUMERIC,
+  client_id       INTEGER,
+  charge_usdt     NUMERIC,                  -- what the client was billed (null = house order)
+  source          TEXT NOT NULL DEFAULT 'admin',  -- admin | api
   response        JSONB,
   detail          TEXT,
   user_id         INTEGER,
   user_email      TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_energy_orders_ts ON energy_orders (ts DESC);
+-- Add billing columns to energy_orders when upgrading an older install.
+ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS client_id   INTEGER;
+ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS charge_usdt NUMERIC;
+ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS source      TEXT NOT NULL DEFAULT 'admin';
+
+CREATE INDEX IF NOT EXISTS idx_energy_orders_ts        ON energy_orders (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_energy_orders_client_id ON energy_orders (client_id);
+
+-- Billing: reseller clients. Each gets a transit deposit wallet + a credit balance.
+CREATE TABLE IF NOT EXISTS clients (
+  id                    SERIAL PRIMARY KEY,
+  name                  TEXT NOT NULL,
+  note                  TEXT,
+  api_key               TEXT UNIQUE NOT NULL,
+  deposit_wallet_id     UUID,
+  deposit_address       TEXT,
+  network               TEXT NOT NULL DEFAULT 'tron',
+  balance_usdt          NUMERIC NOT NULL DEFAULT 0,
+  deposited_total_usdt  NUMERIC NOT NULL DEFAULT 0,  -- last synced on-chain total
+  status                TEXT NOT NULL DEFAULT 'active', -- active | blocked
+  created_by            INTEGER,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients (api_key);
+
+-- Per-client money movements (their billing ledger).
+CREATE TABLE IF NOT EXISTS client_transactions (
+  id            BIGSERIAL PRIMARY KEY,
+  ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  client_id     INTEGER NOT NULL,
+  type          TEXT NOT NULL,          -- deposit | charge | refund | adjust
+  amount_usdt   NUMERIC NOT NULL,       -- positive = credit, negative = debit
+  balance_after NUMERIC NOT NULL,
+  ref           TEXT,
+  detail        TEXT,
+  admin_id      INTEGER,
+  admin_email   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_tx_client ON client_transactions (client_id, ts DESC);
 `;
 
 async function connectWithRetry(attempts = 5): Promise<void> {

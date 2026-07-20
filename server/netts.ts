@@ -49,7 +49,7 @@ async function netts<T = unknown>(path: string, { method = "GET", body, query }:
       (typeof obj.error === "string" && obj.error) ||
       (typeof obj.message === "string" && obj.message) ||
       (typeof obj.detail === "string" && obj.detail) ||
-      `netts error ${res.status}`;
+      `Сервис энергии недоступен (${res.status})`;
     throw new NettsError(String(msg), res.ok ? 400 : res.status);
   }
   return data as T;
