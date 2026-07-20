@@ -1,6 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { query } from "./db.js";
-import { getClientByKey, type ClientRow } from "./billing.js";
+import { getClientByKey, MIN_DEPOSIT_USDT, type ClientRow } from "./billing.js";
 import { placeEnergyOrder, validateOrderInput, OrderError } from "./energyService.js";
 
 export const apiV1 = Router();
@@ -42,6 +42,7 @@ apiV1.get("/balance", (req: ClientRequest, res) => {
     currency: "USDT",
     depositAddress: c.deposit_address,
     network: c.network,
+    minDeposit: MIN_DEPOSIT_USDT,
     status: c.status,
   });
 });
@@ -49,7 +50,12 @@ apiV1.get("/balance", (req: ClientRequest, res) => {
 /** GET /api/v1/deposit — deposit address for topping up the balance. */
 apiV1.get("/deposit", (req: ClientRequest, res) => {
   const c = req.client!;
-  res.json({ depositAddress: c.deposit_address, network: c.network, currency: "USDT" });
+  res.json({
+    depositAddress: c.deposit_address,
+    network: c.network,
+    currency: "USDT",
+    minDeposit: MIN_DEPOSIT_USDT,
+  });
 });
 
 /** POST /api/v1/energy/order — order energy delegation, billed to your balance. */

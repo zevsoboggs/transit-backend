@@ -5,6 +5,7 @@ import { nettsApi } from "./netts.js";
 import { transitApi, type UpstreamWallet } from "./transit.js";
 
 export const MARKUP_PERCENT = Number(process.env.ENERGY_MARKUP_PERCENT || 30);
+export const MIN_DEPOSIT_USDT = Number(process.env.MIN_DEPOSIT_USDT || 500);
 const CLIENT_PROJECT = process.env.CLIENT_PROJECT || "billing";
 
 export interface ClientRow {
@@ -216,10 +217,19 @@ export async function creditClient(
 }
 
 // Read the deposit wallet's live USDT balance and credit any un-credited delta.
+export interface SyncResult {
+  credited: number;
+  balanceUsdt: number;
+  onchainTotal: number;
+  pending: number; // received but not yet credited (below the minimum)
+  minDeposit: number;
+  belowMin: boolean;
+}
+
 export async function syncDeposit(
   client: ClientRow,
   admin?: { id: number; email: string } | null,
-): Promise<{ credited: number; balanceUsdt: number; onchainTotal: number }> {
+): Promise<SyncResult> {
   if (!client.deposit_wallet_id) throw new Error("У клиента нет депозитного кошелька");
   const bal = (await transitApi.getBalance(client.deposit_wallet_id)) as {
     balances?: { isUsdt?: boolean; amount?: number }[];
@@ -229,8 +239,16 @@ export async function syncDeposit(
   const alreadyCredited = Number(client.deposited_total_usdt);
   const delta = round2(onchainTotal - alreadyCredited);
 
-  if (delta <= 0) {
-    return { credited: 0, balanceUsdt: Number(client.balance_usdt), onchainTotal };
+  // Nothing new, or the un-credited amount hasn't reached the minimum deposit yet.
+  if (delta <= 0 || delta < MIN_DEPOSIT_USDT) {
+    return {
+      credited: 0,
+      balanceUsdt: Number(client.balance_usdt),
+      onchainTotal,
+      pending: Math.max(0, delta),
+      minDeposit: MIN_DEPOSIT_USDT,
+      belowMin: delta > 0,
+    };
   }
 
   const newBalance = await withTx(async (c) => {
@@ -256,5 +274,12 @@ export async function syncDeposit(
     return after;
   });
 
-  return { credited: delta, balanceUsdt: newBalance, onchainTotal };
+  return {
+    credited: delta,
+    balanceUsdt: newBalance,
+    onchainTotal,
+    pending: 0,
+    minDeposit: MIN_DEPOSIT_USDT,
+    belowMin: false,
+  };
 }

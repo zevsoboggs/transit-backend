@@ -30,6 +30,7 @@ import {
   creditClient,
   computeCharge,
   MARKUP_PERCENT,
+  MIN_DEPOSIT_USDT,
   type ClientRow,
 } from "./billing.js";
 
@@ -322,7 +323,12 @@ router.get("/energy/egress-ip", async (_req, res) => {
 router.get("/clients", async (_req, res) => {
   try {
     const { rows } = await query<ClientRow>("SELECT * FROM clients ORDER BY created_at DESC");
-    res.json({ clients: rows.map(clientAdmin), count: rows.length, markupPercent: MARKUP_PERCENT });
+    res.json({
+      clients: rows.map(clientAdmin),
+      count: rows.length,
+      markupPercent: MARKUP_PERCENT,
+      minDeposit: MIN_DEPOSIT_USDT,
+    });
   } catch (e) {
     handleError(res, e);
   }
@@ -350,7 +356,7 @@ router.get("/clients/:id", async (req, res) => {
          FROM client_transactions WHERE client_id=$1 ORDER BY ts DESC LIMIT 200`,
       [client.id],
     );
-    res.json({ client: clientAdmin(client), transactions: tx.rows });
+    res.json({ client: clientAdmin(client), transactions: tx.rows, minDeposit: MIN_DEPOSIT_USDT });
   } catch (e) {
     handleError(res, e);
   }

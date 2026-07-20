@@ -25,7 +25,8 @@ export const openapiSpec = {
     description:
       "API для покупки делегирования энергии TRON.\n\n" +
       "У каждого клиента есть депозитный адрес (USDT-TRC20) и баланс. " +
-      "Пополните депозитный адрес — баланс зачисляется, после чего можно заказывать энергию на любой TRON-адрес.\n\n" +
+      "Пополните депозитный адрес (минимальная сумма депозита — 500 USDT) — баланс зачисляется, " +
+      "после чего можно заказывать энергию на любой TRON-адрес.\n\n" +
       "**Аутентификация:** заголовок `X-API-KEY: <ваш ключ>` в каждом запросе.",
   },
   servers: [{ url: SERVER_URL }],
@@ -42,10 +43,11 @@ export const openapiSpec = {
       Balance: {
         type: "object",
         properties: {
-          balance: { type: "number", example: 42.5, description: "Баланс в USDT" },
+          balance: { type: "number", example: 500, description: "Баланс в USDT" },
           currency: { type: "string", example: "USDT" },
           depositAddress: { type: "string", example: "TEWxUUUU9ngJ1PZf7JTsW1javtTiYKnSof" },
           network: { type: "string", example: "tron" },
+          minDeposit: { type: "number", example: 500, description: "Минимальная сумма депозита, USDT" },
           status: { type: "string", example: "active" },
         },
       },
@@ -55,6 +57,7 @@ export const openapiSpec = {
           depositAddress: { type: "string", example: "TEWxUUUU9ngJ1PZf7JTsW1javtTiYKnSof" },
           network: { type: "string", example: "tron" },
           currency: { type: "string", example: "USDT" },
+          minDeposit: { type: "number", example: 500, description: "Минимальная сумма депозита, USDT" },
         },
       },
       OrderRequest: {
