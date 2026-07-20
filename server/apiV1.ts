@@ -1,6 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { query } from "./db.js";
-import { getClientByKey, computeCharge, type ClientRow } from "./billing.js";
+import { getClientByKey, type ClientRow } from "./billing.js";
 import { placeEnergyOrder, validateOrderInput, OrderError } from "./energyService.js";
 
 export const apiV1 = Router();
@@ -52,21 +52,6 @@ apiV1.get("/deposit", (req: ClientRequest, res) => {
   res.json({ depositAddress: c.deposit_address, network: c.network, currency: "USDT" });
 });
 
-/** GET /api/v1/energy/quote?duration=1h&amount=65000 — price for an order. */
-apiV1.get("/energy/quote", async (req, res) => {
-  try {
-    const duration = String(req.query.duration || "1h") as "1h" | "5m";
-    const amount = Math.trunc(Number(req.query.amount));
-    if ((duration !== "1h" && duration !== "5m") || !Number.isFinite(amount)) {
-      return res.status(400).json({ error: "duration (1h|5m) and amount are required" });
-    }
-    const charge = await computeCharge(duration, amount);
-    res.json({ duration, amount, price: charge.chargeUsdt, currency: "USDT" });
-  } catch (e) {
-    fail(res, e);
-  }
-});
-
 /** POST /api/v1/energy/order — order energy delegation, billed to your balance. */
 apiV1.post("/energy/order", async (req: ClientRequest, res) => {
   try {
@@ -88,9 +73,7 @@ apiV1.post("/energy/order", async (req: ClientRequest, res) => {
       duration,
       amount,
       receiveAddress,
-      price: result.chargeUsdt,
       balance: result.balanceUsdt,
-      currency: "USDT",
     });
   } catch (e) {
     fail(res, e);
@@ -101,8 +84,7 @@ apiV1.post("/energy/order", async (req: ClientRequest, res) => {
 apiV1.get("/energy/orders", async (req: ClientRequest, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress",
-              status, charge_usdt::float8 AS price
+      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress", status
          FROM energy_orders WHERE client_id=$1 ORDER BY ts DESC LIMIT 500`,
       [req.client!.id],
     );
@@ -116,8 +98,7 @@ apiV1.get("/energy/orders", async (req: ClientRequest, res) => {
 apiV1.get("/energy/orders/:id", async (req: ClientRequest, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress",
-              status, charge_usdt::float8 AS price
+      `SELECT id, ts, duration, amount::float8 AS amount, receive_address AS "receiveAddress", status
          FROM energy_orders WHERE id=$1 AND client_id=$2`,
       [Number(req.params.id), req.client!.id],
     );

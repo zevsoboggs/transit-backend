@@ -57,15 +57,6 @@ export const openapiSpec = {
           currency: { type: "string", example: "USDT" },
         },
       },
-      Quote: {
-        type: "object",
-        properties: {
-          duration: { type: "string", enum: ["1h", "5m"] },
-          amount: { type: "integer", example: 65000 },
-          price: { type: "number", example: 0.98, description: "Стоимость заказа в USDT" },
-          currency: { type: "string", example: "USDT" },
-        },
-      },
       OrderRequest: {
         type: "object",
         required: ["amount", "receiveAddress"],
@@ -98,9 +89,7 @@ export const openapiSpec = {
           duration: { type: "string", example: "1h" },
           amount: { type: "integer", example: 65000 },
           receiveAddress: { type: "string" },
-          price: { type: "number", example: 0.98, description: "Списано с баланса, USDT" },
           balance: { type: "number", example: 41.52, description: "Остаток баланса, USDT" },
-          currency: { type: "string", example: "USDT" },
         },
       },
       Order: {
@@ -112,7 +101,6 @@ export const openapiSpec = {
           amount: { type: "integer" },
           receiveAddress: { type: "string" },
           status: { type: "string" },
-          price: { type: "number" },
         },
       },
       Transaction: {
@@ -143,26 +131,6 @@ export const openapiSpec = {
         tags: ["Account"],
         summary: "Депозитный адрес для пополнения",
         responses: { "200": ok({ $ref: "#/components/schemas/Deposit" }), "401": errorResponse },
-      },
-    },
-    "/api/v1/energy/quote": {
-      get: {
-        tags: ["Energy"],
-        summary: "Рассчитать стоимость заказа",
-        parameters: [
-          {
-            name: "duration",
-            in: "query",
-            schema: { type: "string", enum: ["1h", "5m"], default: "1h" },
-          },
-          {
-            name: "amount",
-            in: "query",
-            required: true,
-            schema: { type: "integer", minimum: 61000, maximum: 3000000 },
-          },
-        ],
-        responses: { "200": ok({ $ref: "#/components/schemas/Quote" }), "400": errorResponse },
       },
     },
     "/api/v1/energy/order": {
