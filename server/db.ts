@@ -169,6 +169,8 @@ CREATE TABLE IF NOT EXISTS energy_orders (
 ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS client_id   INTEGER;
 ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS charge_usdt NUMERIC;
 ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS source      TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS price_trx   NUMERIC;  -- partner price in TRX
+ALTER TABLE energy_orders ADD COLUMN IF NOT EXISTS trx_rate    NUMERIC;  -- fixed Binance TRX/USDT rate
 
 CREATE INDEX IF NOT EXISTS idx_energy_orders_ts        ON energy_orders (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_energy_orders_client_id ON energy_orders (client_id);

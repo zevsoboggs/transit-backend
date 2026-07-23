@@ -2,10 +2,15 @@ import crypto from "node:crypto";
 import type pg from "pg";
 import { query, withTx } from "./db.js";
 import { nettsApi } from "./netts.js";
+import { getTrxUsdtRate } from "./rates.js";
 import { transitApi, type UpstreamWallet } from "./transit.js";
 
 export const MARKUP_PERCENT = Number(process.env.ENERGY_MARKUP_PERCENT || 30);
 export const MIN_DEPOSIT_USDT = Number(process.env.MIN_DEPOSIT_USDT || 500);
+// Partner tariff: PARTNER_PRICE_TRX per PARTNER_UNIT_ENERGY units of energy,
+// charged in USDT at the Binance TRX/USDT rate (fixed at order time).
+export const PARTNER_PRICE_TRX = Number(process.env.PARTNER_PRICE_TRX || 0.5);
+export const PARTNER_UNIT_ENERGY = Number(process.env.PARTNER_PRICE_UNIT_ENERGY || 65000);
 const CLIENT_PROJECT = process.env.CLIENT_PROJECT || "billing";
 
 export interface ClientRow {
@@ -24,6 +29,10 @@ export interface ClientRow {
 
 export function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+export function round6(n: number): number {
+  return Math.round((n + Number.EPSILON) * 1e6) / 1e6;
 }
 
 export function newApiKey(): string {
@@ -59,29 +68,47 @@ export function clientAdmin(c: ClientRow) {
 }
 
 export interface Charge {
-  priceSun: number | null;
+  amount: number;
+  priceTrx: number; // partner tariff in TRX (fixed)
+  trxUsd: number | null; // Binance TRX/USDT rate (fixed at order time)
+  chargeUsdt: number | null; // what the client pays, USDT (null if rate unavailable)
+  // Provider cost — admin-only, best-effort (for profit reporting).
   costTrx: number | null;
   costUsdt: number | null;
-  chargeUsdt: number | null; // what the client pays
-  trxUsd: number | null;
-  markupPercent: number;
 }
 
-// Cost (provider) vs charge (what we bill the client, cost + markup).
+/**
+ * Partner charge: PARTNER_PRICE_TRX per PARTNER_UNIT_ENERGY, converted to USDT
+ * at the current Binance rate (fixed). Independent of the provider's price —
+ * provider cost is fetched best-effort only for admin profit reporting.
+ */
 export async function computeCharge(duration: "1h" | "5m", amount: number): Promise<Charge> {
-  const s = await nettsApi.priceSummary();
-  const priceSun = duration === "1h" ? s.priceSun1h : s.priceSun5m;
-  const costTrx = priceSun != null ? (amount * priceSun) / 1_000_000 : null;
-  const costUsdt = costTrx != null && s.trxUsd != null ? costTrx * s.trxUsd : null;
-  const chargeUsdt = costUsdt != null ? round2(costUsdt * (1 + MARKUP_PERCENT / 100)) : null;
-  return {
-    priceSun,
-    costTrx,
-    costUsdt,
-    chargeUsdt,
-    trxUsd: s.trxUsd,
-    markupPercent: MARKUP_PERCENT,
-  };
+  const priceTrx = round6((amount / PARTNER_UNIT_ENERGY) * PARTNER_PRICE_TRX);
+
+  let trxUsd: number | null = null;
+  let chargeUsdt: number | null = null;
+  try {
+    trxUsd = await getTrxUsdtRate();
+    chargeUsdt = round6(priceTrx * trxUsd);
+  } catch {
+    /* rate unavailable → chargeUsdt stays null (client orders get rejected) */
+  }
+
+  // Best-effort provider cost (for admin profit view only).
+  let costTrx: number | null = null;
+  let costUsdt: number | null = null;
+  try {
+    const s = await nettsApi.priceSummary();
+    const priceSun = duration === "1h" ? s.priceSun1h : s.priceSun5m;
+    if (priceSun != null) {
+      costTrx = (amount * priceSun) / 1_000_000;
+      if (s.trxUsd != null) costUsdt = round6(costTrx * s.trxUsd);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return { amount, priceTrx, trxUsd, chargeUsdt, costTrx, costUsdt };
 }
 
 export async function getClientById(id: number): Promise<ClientRow | null> {

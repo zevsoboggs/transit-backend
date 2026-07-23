@@ -94,8 +94,8 @@ export async function placeEnergyOrder(params: {
 
   const ins = await query<{ id: string }>(
     `INSERT INTO energy_orders
-      (duration, amount, receive_address, provider_order_id, status, est_cost_trx, client_id, charge_usdt, source, response, user_id, user_email)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      (duration, amount, receive_address, provider_order_id, status, est_cost_trx, client_id, charge_usdt, price_trx, trx_rate, source, response, user_id, user_email)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
     [
       duration,
       amount,
@@ -105,6 +105,8 @@ export async function placeEnergyOrder(params: {
       charge.costTrx,
       client?.id ?? null,
       chargeUsdt,
+      charge.priceTrx,
+      charge.trxUsd,
       source,
       JSON.stringify(resp ?? null),
       admin?.id ?? null,
